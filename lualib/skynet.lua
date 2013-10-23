@@ -95,6 +95,9 @@ function suspend(co, result, command, param, size)
 			trace_count()
 			error(debug.traceback(co))
 		end
+		-- c.send maybe throw a error, so call trace_count first.
+		-- The coroutine execute time after skynet.ret() will not be trace.
+		trace_count()
 		c.send(co_address, 1, co_session, param, size)
 		return suspend(co, coroutine.resume(co))
 	elseif command == "EXIT" then
@@ -122,7 +125,7 @@ function skynet.sleep(ti)
 	local session = c.command("TIMEOUT",tostring(ti))
 	assert(session)
 	session = tonumber(session)
-	local ret = coroutine.yield("SLEEP", session)
+	local ret = coroutine_yield("SLEEP", session)
 	sleep_session[coroutine.running()] = nil
 	if ret == true then
 		c.trace_switch(trace_handle, session)
@@ -131,10 +134,16 @@ function skynet.sleep(ti)
 end
 
 function skynet.yield()
-	local session = c.command("TIMEOUT","0")
-	assert(session)
-	coroutine.yield("SLEEP", tonumber(session))
-	sleep_session[coroutine.running()] = nil
+	return skynet.sleep("0")
+end
+
+function skynet.wait()
+	local session = c.genid()
+	coroutine_yield("SLEEP", session)
+	c.trace_switch(trace_handle, session)
+	local co = coroutine.running()
+	sleep_session[co] = nil
+	session_id_coroutine[session] = nil
 end
 
 function skynet.register(name)
@@ -224,25 +233,29 @@ skynet.tostring = assert(c.tostring)
 function skynet.call(addr, typename, ...)
 	local p = proto[typename]
 	local session = c.send(addr, p.id , nil , p.pack(...))
-	return p.unpack(coroutine.yield("CALL", session))
+	return p.unpack(coroutine_yield("CALL", assert(session, "call to invalid address")))
 end
 
 function skynet.blockcall(addr, typename , ...)
 	local p = proto[typename]
 	c.command("LOCK")
 	local session = c.send(addr, p.id , nil , p.pack(...))
-	return p.unpack(coroutine.yield("CALL", session))
+	if session == nil then
+		c.command("UNLOCK")
+		error("call to invalid address")
+	end
+	return p.unpack(coroutine_yield("CALL", session))
 end
 
 function skynet.rawcall(addr, typename, msg, sz)
 	local p = proto[typename]
 	local session = c.send(addr, p.id , nil , msg, sz)
-	return coroutine.yield("CALL", session)
+	return coroutine_yield("CALL", assert(session, "call to invalid address"))
 end
 
 function skynet.ret(msg, sz)
 	msg = msg or ""
-	coroutine.yield("RETURN", msg, sz)
+	coroutine_yield("RETURN", msg, sz)
 end
 
 function skynet.wakeup(co)
@@ -286,7 +299,6 @@ local function dispatch_message(prototype, msg, sz, session, source, ...)
 		if co == "BREAK" then
 			session_id_coroutine[session] = nil
 		elseif co == nil then
-			c.trace_switch(trace_handle, session)
 			unknown_response(session, source, msg, sz)
 		else
 			c.trace_switch(trace_handle, session)
@@ -397,7 +409,7 @@ do
 			f = function(...)
 				local addr = remote_query(t.__remote)
 				-- the proto is 11 (lua is 10)
-				local session = _send(addr, 11 , nil, _pack(t,method,...))
+				local session = assert(_send(addr, 11 , nil, _pack(t,method,...)), "call to invalid address")
 				local msg, sz = _yield("CALL", session)
 				return select(2,assert(_unpack(msg,sz)))
 			end
@@ -617,6 +629,11 @@ end
 
 function skynet.context_ptr()
 	return c.context()
+end
+
+function skynet.monitor(service)
+	local monitor = skynet.uniqueservice(true, service)
+	c.command("MONITOR", string.format(":%08x", monitor))
 end
 
 return skynet

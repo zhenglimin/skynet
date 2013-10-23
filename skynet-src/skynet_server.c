@@ -49,21 +49,26 @@ struct skynet_context {
 	CHECKCALLING_DECL
 };
 
-static int g_total_context = 0;
+struct skynet_node {
+	int total;
+	uint32_t monitor_exit;
+};
+
+static struct skynet_node G_NODE = { 0,0 };
 
 int 
 skynet_context_total() {
-	return g_total_context;
+	return G_NODE.total;
 }
 
 static void
 _context_inc() {
-	__sync_fetch_and_add(&g_total_context,1);
+	__sync_fetch_and_add(&G_NODE.total,1);
 }
 
 static void
 _context_dec() {
-	__sync_fetch_and_sub(&g_total_context,1);
+	__sync_fetch_and_sub(&G_NODE.total,1);
 }
 
 static void
@@ -121,13 +126,15 @@ skynet_context_new(const char * name, const char *param) {
 	} else {
 		skynet_context_release(ctx);
 		skynet_handle_retire(ctx->handle);
+		skynet_mq_release(queue);
 		return NULL;
 	}
 }
 
 int
 skynet_context_newsession(struct skynet_context *ctx) {
-	int session = ++ctx->session_id;
+	// session always be a positive number
+	int session = (++ctx->session_id) & 0x7fffffff;
 	return session;
 }
 
@@ -347,14 +354,23 @@ skynet_queryname(struct skynet_context * context, const char * name) {
 	return 0;
 }
 
+static void
+handle_exit(struct skynet_context * context, uint32_t handle) {
+	if (G_NODE.monitor_exit) {
+		skynet_send(context,  handle, G_NODE.monitor_exit, PTYPE_CLIENT, 0, NULL, 0);
+	}
+	if (handle == 0) {
+		handle = context->handle;
+	}
+	skynet_handle_retire(handle);
+}
+
 const char * 
 skynet_command(struct skynet_context * context, const char * cmd , const char * param) {
 	if (strcmp(cmd,"TIMEOUT") == 0) {
 		char * session_ptr = NULL;
 		int ti = strtol(param, &session_ptr, 10);
 		int session = skynet_context_newsession(context);
-		if (session < 0) 
-			return NULL;
 		skynet_timeout(context->handle, ti, session);
 		sprintf(context->result, "%d", session);
 		return context->result;
@@ -365,6 +381,14 @@ skynet_command(struct skynet_context * context, const char * cmd , const char * 
 			return NULL;
 		}
 		skynet_mq_lock(context->queue, context->session_id+1);
+		return NULL;
+	}
+
+	if (strcmp(cmd,"UNLOCK") == 0) {
+		if (context->init == false) {
+			return NULL;
+		}
+		skynet_mq_unlock(context->queue);
 		return NULL;
 	}
 
@@ -423,7 +447,7 @@ skynet_command(struct skynet_context * context, const char * cmd , const char * 
 	}
 
 	if (strcmp(cmd,"EXIT") == 0) {
-		skynet_handle_retire(context->handle);
+		handle_exit(context, 0);
 		return NULL;
 	}
 
@@ -438,7 +462,7 @@ skynet_command(struct skynet_context * context, const char * cmd , const char * 
 			// todo : kill global service
 		}
 		if (handle) {
-			skynet_handle_retire(handle);
+			handle_exit(context, handle);
 		}
 		return NULL;
 	}
@@ -513,18 +537,40 @@ skynet_command(struct skynet_context * context, const char * cmd , const char * 
 		return NULL;
 	}
 
+	if (strcmp(cmd,"MONITOR") == 0) {
+		uint32_t handle=0;
+		if (param == NULL || param[0] == '\0') {
+			handle = context->handle;
+		} else {
+			if (param[0] == ':') {
+				handle = strtoul(param+1, NULL, 16);
+			} else if (param[0] == '.') {
+				handle = skynet_handle_findname(param+1);
+			} else {
+				skynet_error(context, "Can't monitor %s",param);
+				// todo : monitor global service
+			}
+		}
+		G_NODE.monitor_exit = handle;
+		return NULL;
+	}
+
 	return NULL;
 }
 
 void 
 skynet_forward(struct skynet_context * context, uint32_t destination) {
 	assert(context->forward == 0);
-	context->forward = destination;
+	if (destination == 0) {
+		context->forward = context->handle;
+	} else {
+		context->forward = destination;
+	}
 }
 
 static void
 _filter_args(struct skynet_context * context, int type, int *session, void ** data, size_t * sz) {
-	int dontcopy = type & PTYPE_TAG_DONTCOPY;
+	int needcopy = !(type & PTYPE_TAG_DONTCOPY);
 	int allocsession = type & PTYPE_TAG_ALLOCSESSION;
 	type &= 0xff;
 
@@ -533,15 +579,12 @@ _filter_args(struct skynet_context * context, int type, int *session, void ** da
 		*session = skynet_context_newsession(context);
 	}
 
-	char * msg;
-	if (dontcopy || *data == NULL) {
-		msg = *data;
-	} else {
-		msg = malloc(*sz+1);
+	if (needcopy && *data) {
+  	char * msg = malloc(*sz+1);
 		memcpy(msg, *data, *sz);
 		msg[*sz] = '\0';
+  	*data = msg;
 	}
-	*data = msg;
 
 	assert((*sz & HANDLE_MASK) == *sz);
 	*sz |= type << HANDLE_REMOTE_SHIFT;
@@ -589,7 +632,9 @@ skynet_sendname(struct skynet_context * context, const char * addr , int type, i
 	} else if (addr[0] == '.') {
 		des = skynet_handle_findname(addr + 1);
 		if (des == 0) {
-			free(data);
+			if (type & PTYPE_TAG_DONTCOPY) {
+  			free(data);
+  		}
 			skynet_error(context, "Drop message to %s", addr);
 			return session;
 		}

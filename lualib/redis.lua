@@ -63,11 +63,10 @@ redcmd[42] = function(fd, data)	-- '*'
 	for i = 1,n do
 		local line = readline(fd,"\r\n")
 		local bytes = tonumber(string.sub(line,2))
-		if bytes < 0 then
-			table.insert(bulk, nil)
-		else
+		if bytes >= 0 then
 			local data = readbytes(fd, bytes + 2)
-			table.insert(bulk, string.sub(data,1,-3))
+			-- bulk[i] = nil when bytes < 0
+			bulk[i] = string.sub(data,1,-3)
 		end
 	end
 	return true, bulk
@@ -135,6 +134,7 @@ end
 
 function command:sismember(key, value)
 	assert(not self.__mode, "sismember can't used in batch mode")
+	local fd = self.__handle
 	socket.lock(fd)
 	socket.write(fd, compose_message { "SISMEMBER", key, value })
 	local ok, ismember = read_response(fd)
@@ -154,8 +154,8 @@ function command:batch(mode)
 				allok = allok and ok
 				allret[i] = ret
 			end
-			assert(allok, "batch read failed")
 			socket.unlock(self.__handle)
+			assert(allok, "batch read failed")
 			self.__mode = false
 			return allret
 		else
